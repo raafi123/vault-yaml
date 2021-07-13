@@ -1,0 +1,241 @@
+---
+- hosts: localhost
+  vars:
+  - vault_download: https://releases.hashicorp.com/vault/1.2.3/vault_1.2.3_linux_amd64.zip
+  - vault_file: "{{ vault_download | basename }}"
+  tasks:
+
+  - name: install unzip
+    yum:
+      name: unzip
+      state: present
+    become: true
+
+  - name: create tls and vault groups
+    group:
+      name: "{{ item }}"
+    with_items:
+      - tls
+      - vault
+    become: true
+    
+  - name: set ownership to tls for certificates
+    file:
+      path: /etc/certs
+      group: tls
+      recurse: yes
+      state: directory
+    become: true
+    
+  - name: create vault user
+    user:
+      name: vault
+      group: vault
+      groups: tls
+      system: y
+      shell: /bin/nologin
+      home: /etc/vault.d 
+      state: present
+    become: true
+    
+  - name: create data and config directory for vault
+    file:
+      path: "{{ item }}"
+      owner: vault
+      group: vault
+      mode: 0750
+      state: directory
+    with_items:
+      - /var/lib/vault
+      - /etc/vault.d
+    become: true
+    
+  - name: download vault
+    get_url:
+      url: "{{ vault_download }}"
+      dest: /tmp
+    
+  - name: unzip vault download
+    unarchive: 
+      src: /tmp/{{ vault_file }}
+      dest: /usr/local/bin
+      remote_src: yes
+    become: true
+    
+  - name: set permissions and ownersip correct for vault executable
+    file:
+      path: /usr/local/bin/vault
+      owner: vault
+      group: vault
+      mode: 0755
+    become: true
+    
+  - name: set memlock capability on vault executable for security
+    shell: >
+      setcap cap_ipc_lock=+ep /usr/local/bin/vault
+    become: true
+    
+  - name: create vault systemd service to run vault as system daemon
+    shell: |
+      echo "[Unit]
+      Description="a tool for managing secrets"
+      Documentation=https://www.vaultproject.io/docs/
+      Requires=network-online.target
+      After=network-online.target
+      ConditionFileNotEmpty=/etc/vault.d/vault.hcl
+    
+      [Service]
+      User=vault
+      Group=vault
+      ProtectSystem=full
+      ProtectHome=read-only
+      PrivateTmp=yes
+      PrivateDevices=yes
+      SecureBits=keep-caps
+      AmbientCapabilities=CAP_IPC_LOCK
+      Capabilities=CAP_IPC_LOCK+ep
+      CapabilityBoundingSet=CAP_SYSLOG CAP_IPC_LOCK
+      NoNewPrivileges=yes
+      ExecStart=/usr/local/bin/vault server -config=/etc/vault.d/vault.hcl
+      ExecReload=/bin/kill --signal HUP $MAINPID
+      KillMode=process
+      KillSignal=SIGINT
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStopSec=30
+      StartLimitIntervalSec=60
+      StartLimitBurst=3
+      LimitNOFILE=65536
+    
+      [Install]
+      WantedBy=multi-user.target" > /etc/systemd/system/vault.service
+    args:
+      creates: /etc/systemd/system/vault.service
+    become: true
+    
+  - name: create vault configuration file 
+    shell: |
+      echo "
+      ui = true
+      listener \"tcp\" {
+        address = \"0.0.0.0:8200\"
+        tls_cert_file = \"/etc/certs/cert.pem\"
+        tls_key_file = \"/etc/certs/key.pem\"
+      }
+    
+      storage \"file\" {
+        path = \"/var/lib/vault\"
+      }" > /etc/vault.d/vault.hcl
+    args:
+      creates: /etc/vault.d/vault.hcl
+    become: true
+    
+  - name: start firewalld and enable autostart
+    systemd:
+      name: firewalld
+      state: started
+      enabled: yes
+    become: true
+
+  - name: firewalld open up port 8200
+    firewalld:
+      port: 8200/tcp
+      permanent: yes
+      state: enabled
+      immediate: yes
+    become: true
+
+  - name: enable and vault start systemd service
+    systemd:
+      name: vault
+      state: started
+      enabled: yes
+      daemon_reload: yes
+    become: true
+
+  - name: obtain vault status to check for initialisation
+    shell: >
+      /usr/local/bin/vault status -format json || true
+    environment:
+      VAULT_ADDR: https://localhost:8200
+      VAULT_SKIP_VERIFY: true
+    register: vault_status
+
+  - name: parse vault_status into vault_status_parsed
+    set_fact:
+      vault_status_parsed: "{{ vault_status.stdout | from_json }}"
+
+  - name: only initialise vault if it isn't initialised
+    block:
+
+    - name: init vault
+      shell: >
+        /usr/local/bin/vault operator init -key-shares=1 -key-threshold=1 -format json
+      environment:
+        VAULT_ADDR: https://localhost:8200
+        VAULT_SKIP_VERIFY: true    
+      register: vault_init
+
+    - name: parse vault_init output into vault_init_parsed
+      set_fact:
+        vault_init_parsed: "{{ vault_init.stdout | from_json }}"
+  
+    - name: write unseal key 1
+      shell: >
+        echo "{{ vault_init_parsed.unseal_keys_b64[0] }}" > unseal_key_1.txt
+
+    - name: write initial root token
+      shell: >
+        echo "{{ vault_init_parsed.root_token }}" > root_token.txt
+
+    when: not vault_status_parsed.initialized
+
+  - name: unseal vault if found sealed
+    shell: >
+      /usr/local/bin/vault operator unseal $(cat unseal_key_1.txt)
+    environment:
+      VAULT_ADDR: https://localhost:8200
+      VAULT_SKIP_VERIFY: true    
+    when: vault_status_parsed.sealed
+
+  - name: write vault environment file
+    shell: |
+      echo "export VAULT_ADDR=https://localhost:8200
+            export VAULT_SKIP_VERIFY=true" > vault.env
+    args:
+      creates: vault.env
+
+  - name: read root token
+    shell: >
+      cat root_token.txt
+    register: cat_root_token
+    changed_when: false
+
+  - name: list vault audit
+    shell: >
+      /usr/local/bin/vault audit list -detailed || true
+    environment:
+      VAULT_ADDR: https://localhost:8200
+      VAULT_SKIP_VERIFY: true 
+      VAULT_TOKEN: "{{ cat_root_token.stdout }}"
+    register: vault_audit_list
+    changed_when: false
+
+  - name: create /var/log/vault directory
+    file:
+      dest: /var/log/vault
+      state: directory
+      owner: vault
+      group: vault
+      mode: 0750
+    become: true
+
+  - name: enable vault auditing to /var/log/vault/audit.log
+    shell: >
+      /usr/local/bin/vault audit enable file file_path=/var/log/vault/audit.log log_raw=true
+    environment:
+      VAULT_ADDR: https://localhost:8200
+      VAULT_SKIP_VERIFY: true 
+      VAULT_TOKEN: "{{ cat_root_token.stdout }}"
+    when: "'/var/log/vault/audit.log' not in vault_audit_list.stdout"
+
