@@ -1,0 +1,10 @@
+---
+- hosts: localhost
+  tasks:
+    - name: "Create a admin tokens for dev access"
+      hashivault_token_create:
+        display_name: "{{a_name}}"
+        policies: ["{{a_name}}"]
+        renewable: True
+        token: "{{admin_token}}"
+      register: "admin_token"
