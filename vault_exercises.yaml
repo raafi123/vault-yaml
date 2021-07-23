@@ -1,0 +1,107 @@
+---
+- hosts: localhost
+  connection: local
+  environment: 
+    VAULT_ADDR: http://127.0.0.1:8200
+    VAULT_TOKEN: root
+    VAULT_SKIP_VERIFY: true
+
+  tasks:
+    - name: "create container for docker to run vault on"
+      command: docker create --name {{ container_name }} --net=vaultnet -p 8200:8200 -h vaultsvr -e VAULT_ADDR={{ vault_address }} -e VAULT_TOKEN={{ root_token }} -v $WORKDIR/plugins:/vault/plugins hashicorp/vault-enterprise:1.7.1_ent server -dev -dev-plugin-dir=/vault/plugins -dev-root-token-id=root
+      register: docker_container
+
+    - name: "print container for docker output"
+      debug:
+        var: docker_container.stdout
+
+    - name: "start docker container hcvault1"
+      command: docker start {{ container_name }}
+      register: docker_start
+
+    - name: "print start docker output"
+      debug:
+        var: docker_start.stdout
+
+    - name: "get all running docker containers"
+      command: docker container ls
+      register: docker_ls
+
+    - name: "printing all running docker containers"
+      debug:
+        var: docker_ls.stdout
+
+    - name: "Login to vault"
+      command: vault login {{ root_token }} -address={{ vault_address }}
+      register: log_vault
+
+    - name: "print login output"
+      debug:
+        var: log_vault.stdout
+
+    - name: "enable kv engine on the vault server"
+      command: vault secrets enable kv
+      register: enable_kv
+
+    - name: "print if kv vault is enabled"
+      debug: 
+        var: enable_kv.stdout
+
+    - name: "Create an admin policy for dev access"
+      command: vault policy write admin policies/admin_policy.hcl
+      register: admin_policy
+
+    - name: "Print admin policy creation output"
+      debug:
+        var: admin_policy.stdout
+
+    - name: "Create an admin token for dev access"
+      command: vault token create -policy=admin
+      register: admin_token
+    
+    - name: "print created admin token"
+      debug:
+        var: admin_token.stdout
+
+    - name: "Writing admin token to file"
+      copy:
+        dest: admin-tokens.txt
+        content: "{{ admin_token.stdout }}\n"
+
+    - name: "write a secret to vault"
+      command: vault kv put kv/{{ secret_tuple_template[0] }} {{ secret_tuple_template[1] }}={{ secret_tuple_template[2] }} 
+      register: write_vault
+
+    - name: "print write response"
+      debug:
+        var: write_vault.stdout
+
+    - name: "collect secret from vault"
+      command: vault kv get kv/{{ secret_tuple_template[0] }} 
+      register: get_vault
+
+    - name: "print get response"
+      debug: 
+        var: get_vault.stdout
+
+    - name: "stop docker instance of vault"
+      command: docker stop {{ container_name }}
+
+    - name: "remove docker container of vault"
+      command: docker rm {{ container_name }}
+
+    - name: "checking that the docker container is fully removed"
+      command: docker container ls
+      register: docker_ls_end
+    
+    - name: "results of checking that all containers are closed"
+      debug:
+        var: docker_ls_end.stdout
+    
+    - name: "Finishing up this script"
+      command: echo "Hooray! I finished running and I ran into no errors!"
+      register: eof
+
+    - name: "Finishing"
+      debug:
+        var: eof.stdout
